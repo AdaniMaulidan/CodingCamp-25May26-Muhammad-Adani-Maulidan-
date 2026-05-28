@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Track your expenses and visualize your budget with ease." />
+    <title>Expense &amp; Budget Visualizer</title>
+
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+    <!-- App Stylesheet -->
+    <link rel="stylesheet" href="css/style.css" />
+  </head>
+  <body>
+
+    <!-- ===== HEADER ===== -->
+    <header class="app-header">
+      <div class="container">
+        <div class="header-inner">
+          <span class="header-icon" aria-hidden="true">💰</span>
+          <h1 class="header-title">Expense &amp; Budget Visualizer</h1>
+        </div>
+      </div>
+    </header>
+
+    <!-- ===== MAIN CONTENT ===== -->
+    <main class="main-content">
+      <div class="container">
+
+        <!-- ===== TOTAL BALANCE CARD ===== -->
+        <section class="balance-section" aria-label="Total Balance">
+          <div class="balance-card">
+            <p class="balance-label">Total Balance</p>
+            <p class="balance-amount" id="totalBalance">$0.00</p>
+            <div class="balance-meta">
+              <div class="balance-meta-item income">
+                <span class="meta-icon" aria-hidden="true">↑</span>
+                <div>
+                  <p class="meta-label">Income</p>
+                  <p class="meta-value" id="totalIncome">$0.00</p>
+                </div>
+              </div>
+              <div class="balance-divider" aria-hidden="true"></div>
+              <div class="balance-meta-item expense">
+                <span class="meta-icon" aria-hidden="true">↓</span>
+                <div>
+                  <p class="meta-label">Expenses</p>
+                  <p class="meta-value" id="totalExpense">$0.00</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== TWO-COLUMN GRID: FORM + CHART ===== -->
+        <div class="grid-two-col">
+
+          <!-- ===== TRANSACTION FORM ===== -->
+          <section class="card form-section" aria-label="Add Transaction">
+            <h2 class="section-title">Add Transaction</h2>
+
+            <form id="transactionForm" novalidate>
+
+              <!-- Item Name -->
+              <div class="form-group">
+                <label class="form-label" for="itemName">Item Name</label>
+                <input
+                  class="form-input"
+                  type="text"
+                  id="itemName"
+                  name="itemName"
+                  placeholder="e.g. Grocery shopping"
+                  autocomplete="off"
+                  required
+                />
+                <span class="form-error" id="itemNameError" role="alert" aria-live="polite"></span>
+              </div>
+
+              <!-- Amount -->
+              <div class="form-group">
+                <label class="form-label" for="amount">Amount ($)</label>
+                <input
+                  class="form-input"
+                  type="number"
+                  id="amount"
+                  name="amount"
+                  placeholder="0.00"
+                  min="0.01"
+                  step="0.01"
+                  required
+                />
+                <span class="form-error" id="amountError" role="alert" aria-live="polite"></span>
+              </div>
+
+              <!-- Category -->
+              <div class="form-group">
+                <label class="form-label" for="category">Category</label>
+                <select class="form-input form-select" id="category" name="category" required>
+                  <option value="" disabled selected>Select a category</option>
+                  <option value="Food">🍔 Food</option>
+                  <option value="Transport">🚗 Transport</option>
+                  <option value="Fun">🎉 Fun</option>
+                </select>
+                <span class="form-error" id="categoryError" role="alert" aria-live="polite"></span>
+              </div>
+
+              <!-- Transaction Type -->
+              <div class="form-group">
+                <label class="form-label">Type</label>
+                <div class="type-toggle" role="group" aria-label="Transaction type">
+                  <button
+                    type="button"
+                    class="type-btn type-btn--expense active"
+                    id="typeExpense"
+                    aria-pressed="true"
+                    data-type="expense"
+                  >
+                    Expense
+                  </button>
+                  <button
+                    type="button"
+                    class="type-btn type-btn--income"
+                    id="typeIncome"
+                    aria-pressed="false"
+                    data-type="income"
+                  >
+                    Income
+                  </button>
+                </div>
+                <input type="hidden" id="transactionType" name="transactionType" value="expense" />
+              </div>
+
+              <!-- Submit -->
+              <button type="submit" class="btn-submit" id="submitBtn">
+                <span class="btn-icon" aria-hidden="true">+</span>
+                Add Transaction
+              </button>
+
+            </form>
+          </section>
+
+          <!-- ===== CHART SECTION ===== -->
+          <section class="card chart-section" aria-label="Expense Chart">
+            <h2 class="section-title">Spending Breakdown</h2>
+
+            <!-- Chart placeholder shown when no data -->
+            <div class="chart-placeholder" id="chartPlaceholder">
+              <div class="placeholder-icon" aria-hidden="true">📊</div>
+              <p class="placeholder-text">Add transactions to see your spending breakdown</p>
+            </div>
+
+            <!-- Canvas for Chart.js pie chart (hidden until data exists) -->
+            <div class="chart-wrapper" id="chartWrapper" hidden>
+              <canvas id="expenseChart" role="img" aria-label="Pie chart showing expense breakdown by category"></canvas>
+            </div>
+
+            <!-- Chart legend placeholder -->
+            <div class="chart-legend" id="chartLegend"></div>
+          </section>
+
+        </div><!-- end .grid-two-col -->
+
+        <!-- ===== TRANSACTIONS LIST ===== -->
+        <section class="card transactions-section" aria-label="Transaction History">
+          <div class="transactions-header">
+            <h2 class="section-title">Transaction History</h2>
+            <button class="btn-clear" id="clearAllBtn" aria-label="Clear all transactions" disabled>
+              Clear All
+            </button>
+          </div>
+
+          <!-- Empty state (shown when list is empty) -->
+          <div class="empty-state" id="emptyState" role="status" aria-live="polite">
+            <div class="empty-icon" aria-hidden="true">🧾</div>
+            <p class="empty-title">No transactions yet</p>
+            <p class="empty-subtitle">Add your first transaction using the form above.</p>
+          </div>
+
+          <!-- Scrollable transaction list (hidden when empty) -->
+          <ul class="transaction-list" id="transactionList" aria-label="List of transactions" hidden></ul>
+
+        </section>
+
+      </div><!-- end .container -->
+    </main>
+
+    <!-- ===== FOOTER ===== -->
+    <footer class="app-footer">
+      <div class="container">
+        <p class="footer-text">Expense &amp; Budget Visualizer &copy; 2026</p>
+      </div>
+    </footer>
+
+    <!-- App Script -->
+    <script src="js/script.js"></script>
+  </body>
+</html>
