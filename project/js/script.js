@@ -3,18 +3,28 @@
  * =========================================
  * Features:
  *  1.  Add / delete / clear transactions
- *  2.  Form validation (all fields, positive amounts, trimmed input)
+ *  2.  Form validation (all fields, positive amounts ≥ $0.01, trimmed input)
  *  3.  Auto-calculate balance, income, expenses
- *  4.  Persist transactions to localStorage
- *  5.  Doughnut chart via Chart.js (expenses by category)
- *  6.  Dark / Light mode toggle (persisted)
- *  7.  Custom categories (add, remove, persisted, reflected in chart)
- *  8.  Sort transactions (date desc/asc, amount desc/asc, category A-Z)
+ *  4.  Persist all state to localStorage (transactions, categories, theme, sort)
+ *  5.  Doughnut chart via Chart.js (expenses by category, auto-updates)
+ *  6.  Dark / Light mode toggle (persisted, chart updates on toggle)
+ *  7.  Custom categories (add/remove, persisted, reflected in dropdown + chart)
+ *  8.  Sort transactions (date desc/asc, amount desc/asc, category A-Z, persisted)
  *
  * Architecture:
  *  - Single source of truth: `state` object
- *  - Every mutation calls persist() then renderAll()
- *  - renderAll() updates balance, list, and chart in one pass
+ *  - Every mutation calls persist() then the relevant render function(s)
+ *  - renderAll() is the master refresh — balance + list + chart in one pass
+ *
+ * Fixes applied vs previous version:
+ *  - Duplicate category options: static HTML options removed; JS owns the select entirely
+ *  - Sort order now persisted to localStorage
+ *  - Amount validation now enforces ≥ 0.01 (matches HTML min attribute)
+ *  - Chart borderColor updated on theme toggle (was only updating backgroundColor)
+ *  - expenseChart.update() called without invalid 'active' mode argument
+ *  - Balance negative state uses CSS class instead of hardcoded inline colour
+ *  - window.confirm() replaced with inline confirm bar (non-blocking, styleable)
+ *  - Dead code removed (unreachable default sort branch)
  */
 
 'use strict';
@@ -24,10 +34,10 @@
    ============================================================ */
 
 const state = {
-  transactions:       [],   // { id, name, amount, category, type, date }
-  customCategories:   [],   // { name, color, emoji }
-  theme:              'light',
-  sortOrder:          'date-desc',
+  transactions:     [],      // { id, name, amount, category, type, date }
+  customCategories: [],      // { name, color, emoji }
+  theme:            'light', // 'light' | 'dark'
+  sortOrder:        'date-desc',
 };
 
 /* ============================================================
@@ -38,6 +48,7 @@ const KEYS = {
   transactions:     'ebv_transactions',
   customCategories: 'ebv_custom_categories',
   theme:            'ebv_theme',
+  sortOrder:        'ebv_sort_order',
 };
 
 /* ============================================================
@@ -45,7 +56,7 @@ const KEYS = {
    ============================================================ */
 
 /**
- * Default categories with emoji, chart colour, and CSS class.
+ * Default categories — emoji, chart colour, CSS class.
  * Custom categories are merged in at runtime via getCategories().
  */
 const BUILTIN_CATEGORIES = {
@@ -58,12 +69,13 @@ const FALLBACK_CATEGORY = { emoji: '💳', color: '#6c63ff', cssClass: 'cat-defa
 
 /**
  * Merge built-in and custom categories into one lookup map.
- * @returns {Object} Combined category config keyed by name
+ * Called fresh each time so custom additions are always reflected.
+ * @returns {Object}
  */
 function getCategories() {
   const map = { ...BUILTIN_CATEGORIES };
   state.customCategories.forEach((c) => {
-    map[c.name] = { emoji: c.emoji || '🏷️', color: c.color, cssClass: 'cat-custom' };
+    map[c.name] = { emoji: '🏷️', color: c.color, cssClass: 'cat-custom' };
   });
   return map;
 }
@@ -71,7 +83,7 @@ function getCategories() {
 /**
  * Look up config for a single category name.
  * @param {string} name
- * @returns {{ emoji, color, cssClass }}
+ * @returns {{ emoji: string, color: string, cssClass: string }}
  */
 function getCategoryConfig(name) {
   return getCategories()[name] || FALLBACK_CATEGORY;
@@ -81,11 +93,9 @@ function getCategoryConfig(name) {
    4. DOM REFERENCES
    ============================================================ */
 
-// Header
 const themeToggleBtn = document.getElementById('themeToggle');
 const themeIcon      = document.getElementById('themeIcon');
 
-// Form
 const form           = document.getElementById('transactionForm');
 const itemNameInput  = document.getElementById('itemName');
 const amountInput    = document.getElementById('amount');
@@ -93,24 +103,24 @@ const categorySelect = document.getElementById('category');
 const typeHidden     = document.getElementById('transactionType');
 const typeButtons    = document.querySelectorAll('.type-btn');
 
-// Balance
 const totalBalanceEl = document.getElementById('totalBalance');
 const totalIncomeEl  = document.getElementById('totalIncome');
 const totalExpenseEl = document.getElementById('totalExpense');
 
-// Transaction list
 const transactionList = document.getElementById('transactionList');
 const emptyState      = document.getElementById('emptyState');
 const clearAllBtn     = document.getElementById('clearAllBtn');
 const sortSelect      = document.getElementById('sortSelect');
 
-// Chart
+const confirmBar = document.getElementById('confirmBar');
+const confirmYes = document.getElementById('confirmYes');
+const confirmNo  = document.getElementById('confirmNo');
+
 const chartPlaceholder = document.getElementById('chartPlaceholder');
 const chartWrapper     = document.getElementById('chartWrapper');
 const chartCanvas      = document.getElementById('expenseChart');
 const chartLegend      = document.getElementById('chartLegend');
 
-// Custom categories
 const newCategoryName  = document.getElementById('newCategoryName');
 const newCategoryColor = document.getElementById('newCategoryColor');
 const addCategoryBtn   = document.getElementById('addCategoryBtn');
@@ -121,7 +131,7 @@ const categoryNameErr  = document.getElementById('categoryNameError');
    5. CHART INSTANCE
    ============================================================ */
 
-/** Active Chart.js instance — must be destroyed before recreating */
+/** Active Chart.js instance. Destroyed before recreating to avoid canvas errors. */
 let expenseChart = null;
 
 /* ============================================================
@@ -129,7 +139,8 @@ let expenseChart = null;
    ============================================================ */
 
 /**
- * Format a number as USD. Always positive — caller adds sign.
+ * Format a number as USD currency. Always returns a positive value.
+ * The caller is responsible for prepending a sign where needed.
  * @param {number} value
  * @returns {string} e.g. "$1,234.56"
  */
@@ -142,16 +153,16 @@ function formatCurrency(value) {
 }
 
 /**
- * Format an ISO date string to "May 28" style.
+ * Format an ISO date string to a short readable date.
  * @param {string} iso
- * @returns {string}
+ * @returns {string} e.g. "May 28"
  */
 function formatDate(iso) {
   return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
 /**
- * Generate a unique ID: timestamp + random suffix.
+ * Generate a unique transaction ID.
  * @returns {string}
  */
 function generateId() {
@@ -159,7 +170,7 @@ function generateId() {
 }
 
 /**
- * Escape HTML special characters to prevent XSS.
+ * Escape HTML special characters to prevent XSS when injecting into innerHTML.
  * @param {string} str
  * @returns {string}
  */
@@ -169,35 +180,45 @@ function escapeHTML(str) {
 }
 
 /* ============================================================
-   7. PERSISTENCE (localStorage)
+   7. PERSISTENCE
    ============================================================ */
 
-/** Save all persisted state slices to localStorage. */
+/**
+ * Save all state slices to localStorage.
+ * Wrapped in try/catch — localStorage may be unavailable in private browsing.
+ */
 function persist() {
   try {
     localStorage.setItem(KEYS.transactions,     JSON.stringify(state.transactions));
     localStorage.setItem(KEYS.customCategories, JSON.stringify(state.customCategories));
     localStorage.setItem(KEYS.theme,            state.theme);
+    localStorage.setItem(KEYS.sortOrder,        state.sortOrder); // FIX: was not persisted
   } catch (err) {
     console.warn('[EBV] localStorage write failed:', err);
   }
 }
 
-/** Load all persisted state slices from localStorage. */
+/**
+ * Load all state slices from localStorage on app init.
+ * Falls back to safe defaults on any parse error.
+ */
 function loadFromStorage() {
   try {
-    const txRaw  = localStorage.getItem(KEYS.transactions);
-    const catRaw = localStorage.getItem(KEYS.customCategories);
-    const theme  = localStorage.getItem(KEYS.theme);
+    const txRaw    = localStorage.getItem(KEYS.transactions);
+    const catRaw   = localStorage.getItem(KEYS.customCategories);
+    const theme    = localStorage.getItem(KEYS.theme);
+    const sortOrder = localStorage.getItem(KEYS.sortOrder);
 
     state.transactions     = txRaw  ? JSON.parse(txRaw)  : [];
     state.customCategories = catRaw ? JSON.parse(catRaw) : [];
     state.theme            = theme === 'dark' ? 'dark' : 'light';
+    state.sortOrder        = sortOrder || 'date-desc'; // FIX: restore persisted sort
   } catch (err) {
     console.warn('[EBV] localStorage read failed:', err);
     state.transactions     = [];
     state.customCategories = [];
     state.theme            = 'light';
+    state.sortOrder        = 'date-desc';
   }
 }
 
@@ -205,25 +226,33 @@ function loadFromStorage() {
    8. THEME — DARK / LIGHT MODE
    ============================================================ */
 
-/** Apply the current theme to the <html> element and update the toggle button. */
+/** Apply the current theme to <html> and update the toggle button label/icon. */
 function applyTheme() {
   document.documentElement.setAttribute('data-theme', state.theme);
   const isDark = state.theme === 'dark';
   themeIcon.textContent = isDark ? '☀️' : '🌙';
-  themeToggleBtn.setAttribute('aria-label', isDark ? 'Switch to light mode' : 'Switch to dark mode');
+  themeToggleBtn.setAttribute(
+    'aria-label',
+    isDark ? 'Switch to light mode' : 'Switch to dark mode'
+  );
 }
 
-/** Toggle between dark and light, persist, and apply. */
+/**
+ * Toggle theme, persist, apply, and update chart colours.
+ * FIX: now also updates chart borderColor (was only updating tooltip/backgroundColor).
+ */
 function toggleTheme() {
   state.theme = state.theme === 'dark' ? 'light' : 'dark';
   persist();
   applyTheme();
 
-  // Chart colours need to update when theme changes
   if (expenseChart) {
-    expenseChart.options.plugins.tooltip.bodyColor =
-      state.theme === 'dark' ? '#e2e8f0' : '#1e1e2e';
-    expenseChart.update();
+    const borderCol = state.theme === 'dark' ? '#1a1a2e' : '#ffffff';
+    const textCol   = state.theme === 'dark' ? '#e2e8f0' : '#1e1e2e';
+
+    expenseChart.data.datasets[0].borderColor          = borderCol; // FIX: was missing
+    expenseChart.options.plugins.tooltip.bodyColor     = textCol;
+    expenseChart.update(); // FIX: removed invalid 'active' mode argument
   }
 }
 
@@ -234,13 +263,14 @@ themeToggleBtn.addEventListener('click', toggleTheme);
    ============================================================ */
 
 /**
- * Rebuild the category <select> options from built-ins + custom categories.
- * Preserves the currently selected value if it still exists.
+ * Rebuild the category <select> from scratch.
+ * FIX: HTML no longer has static <option> tags — JS owns the select entirely,
+ * preventing duplicate options on init.
+ * Restores the previously selected value if it still exists.
  */
 function renderCategorySelect() {
   const current = categorySelect.value;
 
-  // Clear all options except the placeholder
   categorySelect.innerHTML = '<option value="" disabled>Select a category</option>';
 
   // Built-in options
@@ -259,19 +289,21 @@ function renderCategorySelect() {
     categorySelect.appendChild(opt);
   });
 
-  // Restore selection if still valid
-  if (current && [...categorySelect.options].some((o) => o.value === current)) {
+  // Restore selection if it still exists in the rebuilt list
+  const stillExists = [...categorySelect.options].some((o) => o.value === current);
+  if (current && stillExists) {
     categorySelect.value = current;
   }
 }
 
 /**
- * Render the custom-category chips below the add form.
- * Each chip has a remove button.
+ * Render custom category chips below the add form.
+ * Each chip has a colour dot and a remove button.
  */
 function renderCategoryChips() {
   if (state.customCategories.length === 0) {
-    categoryChips.innerHTML = '<p style="font-size:0.75rem;color:var(--color-text-muted)">No custom categories yet.</p>';
+    categoryChips.innerHTML =
+      '<p style="font-size:0.75rem;color:var(--color-text-muted)">No custom categories yet.</p>';
     return;
   }
 
@@ -295,14 +327,13 @@ function renderCategoryChips() {
 }
 
 /**
- * Add a new custom category.
- * Validates: non-empty name, not a duplicate of built-in or existing custom.
+ * Add a new custom category after validation.
+ * Validates: non-empty, not a duplicate (case-insensitive).
  */
 function addCustomCategory() {
   const name  = newCategoryName.value.trim();
   const color = newCategoryColor.value;
 
-  // Validate name
   if (!name) {
     categoryNameErr.textContent = 'Please enter a category name.';
     newCategoryName.classList.add('is-invalid');
@@ -310,7 +341,6 @@ function addCustomCategory() {
     return;
   }
 
-  // Check for duplicates (case-insensitive)
   const allNames = [
     ...Object.keys(BUILTIN_CATEGORIES),
     ...state.customCategories.map((c) => c.name),
@@ -323,28 +353,24 @@ function addCustomCategory() {
     return;
   }
 
-  // Clear error
   categoryNameErr.textContent = '';
   newCategoryName.classList.remove('is-invalid');
 
-  // Add to state
   state.customCategories.push({ name, color, emoji: '🏷️' });
   persist();
 
-  // Update UI
   renderCategorySelect();
   renderCategoryChips();
-  renderChart(); // chart may need new colour
+  renderChart(); // chart may need the new colour
 
-  // Reset inputs
-  newCategoryName.value = '';
+  newCategoryName.value  = '';
   newCategoryColor.value = '#10b981';
   newCategoryName.focus();
 }
 
 /**
  * Remove a custom category by name.
- * Transactions that used it keep their data — they just fall back to default styling.
+ * Existing transactions that used it keep their data but fall back to default styling.
  * @param {string} name
  */
 function removeCustomCategory(name) {
@@ -355,19 +381,16 @@ function removeCustomCategory(name) {
   renderChart();
 }
 
-// Add button click
 addCategoryBtn.addEventListener('click', addCustomCategory);
 
-// Enter key in name input
 newCategoryName.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); addCustomCategory(); }
 });
 
-// Remove chip via event delegation
+// Event delegation for chip remove buttons
 categoryChips.addEventListener('click', (e) => {
   const btn = e.target.closest('.category-chip-remove');
-  if (!btn) return;
-  removeCustomCategory(btn.dataset.name);
+  if (btn) removeCustomCategory(btn.dataset.name);
 });
 
 /* ============================================================
@@ -391,7 +414,7 @@ typeButtons.forEach((btn) => {
    ============================================================ */
 
 /**
- * Validate a text/select field. Shows error if empty or browser-invalid.
+ * Validate a text/select field.
  * @param {HTMLElement} input
  * @param {HTMLElement} errorEl
  * @param {string} message
@@ -405,22 +428,23 @@ function validateField(input, errorEl, message) {
 }
 
 /**
- * Validate the amount field: must be a positive number.
+ * Validate the amount field.
+ * FIX: now enforces val >= 0.01 to match the HTML min="0.01" attribute.
  * @returns {boolean}
  */
 function validateAmount() {
   const errorEl = document.getElementById('amountError');
   const raw     = amountInput.value.trim();
   const val     = parseFloat(raw);
-  const isValid = raw !== '' && !isNaN(val) && val > 0;
+  const isValid = raw !== '' && !isNaN(val) && val >= 0.01;
 
   amountInput.classList.toggle('is-invalid', !isValid);
-  errorEl.textContent = isValid ? '' : 'Enter a valid amount greater than $0.';
+  errorEl.textContent = isValid ? '' : 'Enter a valid amount of at least $0.01.';
   return isValid;
 }
 
 /**
- * Run all field validators. All errors shown simultaneously.
+ * Run all validators simultaneously (no short-circuit — all errors shown at once).
  * @returns {boolean}
  */
 function validateForm() {
@@ -438,7 +462,7 @@ function validateForm() {
   return nameOk && amountOk && categoryOk;
 }
 
-/** Clear all validation states. */
+/** Clear all validation error states from the form. */
 function clearValidation() {
   [itemNameInput, amountInput, categorySelect].forEach((el) => el.classList.remove('is-invalid'));
   ['itemNameError', 'amountError', 'categoryError'].forEach((id) => {
@@ -446,7 +470,7 @@ function clearValidation() {
   });
 }
 
-/** Reset type toggle to default (Expense). */
+/** Reset the type toggle back to the default (Expense). */
 function resetTypeToggle() {
   typeButtons.forEach((b) => {
     b.classList.remove('active');
@@ -471,26 +495,30 @@ form.addEventListener('submit', (e) => {
     name:     itemNameInput.value.trim(),
     amount:   parseFloat(parseFloat(amountInput.value).toFixed(2)),
     category: categorySelect.value,
-    type:     typeHidden.value,   // 'expense' | 'income'
+    type:     typeHidden.value,  // 'expense' | 'income'
     date:     new Date().toISOString(),
   };
 
-  state.transactions.unshift(transaction);
+  state.transactions.unshift(transaction); // newest first
   persist();
   renderAll();
 
   form.reset();
   clearValidation();
   resetTypeToggle();
+
+  // Rebuild select after reset so custom options are preserved
+  renderCategorySelect();
+
   itemNameInput.focus();
 });
 
 /* ============================================================
-   13. DELETE / CLEAR TRANSACTIONS
+   13. DELETE TRANSACTION
    ============================================================ */
 
 /**
- * Remove a transaction by ID, persist, re-render.
+ * Remove a transaction by ID, persist, and re-render.
  * @param {string} id
  */
 function deleteTransaction(id) {
@@ -499,27 +527,50 @@ function deleteTransaction(id) {
   renderAll();
 }
 
-// Event delegation — one listener handles all delete buttons
+// Event delegation — one listener handles all delete buttons in the list
 transactionList.addEventListener('click', (e) => {
   const btn = e.target.closest('.transaction-delete');
   if (btn && btn.dataset.id) deleteTransaction(btn.dataset.id);
 });
 
-// Clear all
-clearAllBtn.addEventListener('click', () => {
-  if (!window.confirm('Delete all transactions? This cannot be undone.')) return;
+/* ============================================================
+   14. CLEAR ALL — INLINE CONFIRM BAR
+   FIX: replaced window.confirm() with a non-blocking inline confirm bar.
+   window.confirm() blocks the UI thread and cannot be styled.
+   ============================================================ */
+
+/** Show the inline confirm bar and hide the Clear All button. */
+function showConfirmBar() {
+  confirmBar.hidden = false;
+  clearAllBtn.hidden = true;
+  confirmYes.focus();
+}
+
+/** Hide the confirm bar and restore the Clear All button. */
+function hideConfirmBar() {
+  confirmBar.hidden = true;
+  clearAllBtn.hidden = false;
+}
+
+clearAllBtn.addEventListener('click', showConfirmBar);
+
+confirmYes.addEventListener('click', () => {
   state.transactions = [];
   persist();
+  hideConfirmBar();
   renderAll();
 });
 
+confirmNo.addEventListener('click', hideConfirmBar);
+
 /* ============================================================
-   14. SORT
+   15. SORT
    ============================================================ */
 
 /**
- * Return a sorted copy of the transactions array based on state.sortOrder.
+ * Return a sorted copy of the transactions array.
  * Does NOT mutate the original array.
+ * FIX: removed unreachable default branch (dead code).
  * @returns {Array}
  */
 function getSortedTransactions() {
@@ -528,36 +579,32 @@ function getSortedTransactions() {
   switch (state.sortOrder) {
     case 'date-asc':
       return list.sort((a, b) => new Date(a.date) - new Date(b.date));
-
     case 'date-desc':
       return list.sort((a, b) => new Date(b.date) - new Date(a.date));
-
     case 'amount-asc':
       return list.sort((a, b) => a.amount - b.amount);
-
     case 'amount-desc':
       return list.sort((a, b) => b.amount - a.amount);
-
     case 'category-asc':
       return list.sort((a, b) => a.category.localeCompare(b.category));
-
-    default:
-      return list;
   }
+
+  return list; // fallback (should never reach here with valid sortOrder values)
 }
 
-// Update sort order and re-render list when dropdown changes
+// Persist sort order and re-render list on dropdown change
 sortSelect.addEventListener('change', () => {
   state.sortOrder = sortSelect.value;
+  persist(); // FIX: sort order is now persisted
   renderTransactionList();
 });
 
 /* ============================================================
-   15. BALANCE CALCULATION & RENDER
+   16. BALANCE CALCULATION & RENDER
    ============================================================ */
 
 /**
- * Sum income and expense totals.
+ * Sum income and expense totals from all transactions.
  * @returns {{ income: number, expense: number, balance: number }}
  */
 function calculateTotals() {
@@ -572,7 +619,11 @@ function calculateTotals() {
   );
 }
 
-/** Update the balance card DOM. */
+/**
+ * Update the balance card DOM.
+ * FIX: uses CSS class 'is-negative' instead of hardcoded inline colour,
+ * so the colour respects the design token system.
+ */
 function renderBalance() {
   const { income, expense, balance } = calculateTotals();
   const sign = balance < 0 ? '-' : '';
@@ -581,12 +632,12 @@ function renderBalance() {
   totalIncomeEl.textContent  = formatCurrency(income);
   totalExpenseEl.textContent = formatCurrency(expense);
 
-  // Red tint when negative
-  totalBalanceEl.style.color = balance < 0 ? '#fca5a5' : '#ffffff';
+  // Toggle CSS class for negative balance colour
+  totalBalanceEl.classList.toggle('is-negative', balance < 0);
 }
 
 /* ============================================================
-   16. TRANSACTION LIST RENDER
+   17. TRANSACTION LIST RENDER
    ============================================================ */
 
 /** Rebuild the transaction list from sorted state. */
@@ -597,20 +648,23 @@ function renderTransactionList() {
   transactionList.hidden = !hasItems;
   clearAllBtn.disabled   = !hasItems;
 
+  // Hide confirm bar if list becomes empty
   if (!hasItems) {
+    hideConfirmBar();
     transactionList.innerHTML = '';
     return;
   }
 
-  // One DOM write with sorted items
+  // Single DOM write with all sorted items
   transactionList.innerHTML = getSortedTransactions()
     .map(buildTransactionHTML)
     .join('');
 }
 
 /**
- * Build HTML for a single transaction list item.
- * @param {Object} t
+ * Build the HTML string for a single transaction list item.
+ * All user-supplied strings are escaped to prevent XSS.
+ * @param {Object} t - Transaction object
  * @returns {string}
  */
 function buildTransactionHTML(t) {
@@ -644,11 +698,12 @@ function buildTransactionHTML(t) {
 }
 
 /* ============================================================
-   17. CHART RENDER (Chart.js doughnut)
+   18. CHART RENDER (Chart.js doughnut)
    ============================================================ */
 
 /**
- * Aggregate expense totals by category (income excluded).
+ * Aggregate expense totals by category.
+ * Income transactions are intentionally excluded from the chart.
  * @returns {{ labels: string[], data: number[], colors: string[] }}
  */
 function getChartData() {
@@ -669,9 +724,14 @@ function getChartData() {
 
 /**
  * Create or update the Chart.js doughnut chart.
- * - No data → destroy chart, show placeholder.
- * - Chart exists → update in-place (no flicker).
- * - No chart yet → create fresh instance.
+ *
+ * Strategy:
+ *  - No expense data → destroy chart (if any), show placeholder.
+ *  - Chart exists → update data in-place (no flicker, no canvas reuse error).
+ *  - No chart yet → create a fresh instance.
+ *
+ * FIX: expenseChart.update() called without invalid 'active' argument.
+ * FIX: borderColor now updated on theme change via toggleTheme().
  */
 function renderChart() {
   const { labels, data, colors } = getChartData();
@@ -686,16 +746,17 @@ function renderChart() {
     return;
   }
 
-  // Determine text colour based on current theme
-  const textColor = state.theme === 'dark' ? '#e2e8f0' : '#1e1e2e';
+  const borderCol = state.theme === 'dark' ? '#1a1a2e' : '#ffffff';
+  const textCol   = state.theme === 'dark' ? '#e2e8f0' : '#1e1e2e';
 
   if (expenseChart) {
-    // Update existing chart data in-place
+    // Update existing chart in-place
     expenseChart.data.labels                      = labels;
     expenseChart.data.datasets[0].data            = data;
     expenseChart.data.datasets[0].backgroundColor = colors;
-    expenseChart.options.plugins.tooltip.bodyColor = textColor;
-    expenseChart.update('active');
+    expenseChart.data.datasets[0].borderColor     = borderCol;
+    expenseChart.options.plugins.tooltip.bodyColor = textCol;
+    expenseChart.update(); // FIX: no invalid mode argument
   } else {
     // Create new chart instance
     expenseChart = new Chart(chartCanvas, {
@@ -705,7 +766,7 @@ function renderChart() {
         datasets: [{
           data,
           backgroundColor: colors,
-          borderColor: state.theme === 'dark' ? '#1a1a2e' : '#ffffff',
+          borderColor: borderCol,
           borderWidth: 3,
           hoverOffset: 10,
         }],
@@ -718,7 +779,7 @@ function renderChart() {
         plugins: {
           legend: { display: false }, // custom legend rendered below
           tooltip: {
-            bodyColor: textColor,
+            bodyColor: textCol,
             callbacks: {
               label: (ctx) => {
                 const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
@@ -736,7 +797,7 @@ function renderChart() {
 }
 
 /**
- * Render a custom legend below the chart.
+ * Render a custom legend below the doughnut chart.
  * @param {string[]} labels
  * @param {string[]} colors
  * @param {number[]} data
@@ -758,12 +819,12 @@ function renderChartLegend(labels, colors, data) {
 }
 
 /* ============================================================
-   18. MASTER RENDER
+   19. MASTER RENDER
    ============================================================ */
 
 /**
- * Re-render all UI sections from current state.
- * Call after every state mutation.
+ * Re-render all data-driven UI sections from current state.
+ * Call this after any mutation to state.transactions.
  */
 function renderAll() {
   renderBalance();
@@ -772,26 +833,26 @@ function renderAll() {
 }
 
 /* ============================================================
-   19. INITIALISATION
+   20. INITIALISATION
    ============================================================ */
 
 function init() {
-  // 1. Restore persisted state
+  // 1. Restore all persisted state
   loadFromStorage();
 
-  // 2. Apply saved theme
+  // 2. Apply saved theme to <html>
   applyTheme();
 
-  // 3. Sync sort dropdown to state (default is 'date-desc')
+  // 3. Sync sort dropdown to persisted sort order
   sortSelect.value = state.sortOrder;
 
-  // 4. Populate category select with built-ins + custom
+  // 4. Build category select (JS owns this entirely — no static HTML options)
   renderCategorySelect();
 
   // 5. Render custom category chips
   renderCategoryChips();
 
-  // 6. Render all data-driven UI
+  // 6. Render all data-driven sections
   renderAll();
 }
 
