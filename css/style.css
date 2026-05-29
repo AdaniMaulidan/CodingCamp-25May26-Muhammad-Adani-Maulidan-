@@ -110,6 +110,17 @@
 /* ── 3. RESET & BASE ───────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/*
+ * BUG FIX: Enforce the HTML `hidden` attribute across all elements.
+ * Without this, explicit `display: flex` / `display: grid` rules in the
+ * author stylesheet override the browser's built-in `[hidden]{display:none}`,
+ * causing .chart-placeholder and .empty-state to remain visible even when
+ * JavaScript sets element.hidden = true.
+ * The `!important` is intentional and correct here — it restores the expected
+ * semantic behaviour of the `hidden` attribute against any display override.
+ */
+[hidden] { display: none !important; }
+
 html {
   font-size: 16px;
   scroll-behavior: smooth;
